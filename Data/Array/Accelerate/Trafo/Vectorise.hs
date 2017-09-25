@@ -31,9 +31,7 @@
 
 module Data.Array.Accelerate.Trafo.Vectorise (
 
-  vectoriseSeq,
-  vectoriseSeqAcc,
-  vectoriseSeqAfun,
+  liftFun1,
 
   liftOpenAfun1,
   liftOpenAfun2,
@@ -50,7 +48,7 @@ import Control.Applicative                              hiding ( Const )
 import Data.Maybe
 
 -- friends
-import Data.Array.Accelerate.AST
+import Data.Array.Accelerate.AST                       hiding ( liftPreOpenAcc )
 import Data.Array.Accelerate.Analysis.Match            ( matchIdx )
 import Data.Array.Accelerate.Array.Lifted
 import Data.Array.Accelerate.Array.Representation      ( SliceIndex(..) )
@@ -75,7 +73,7 @@ import Data.Array.Accelerate.Error
 --
 data Context env aenv env' aenv' where
   -- All environments are empty
-  EmptyC     :: Context () () () ()
+  EmptyC     :: Context ( ) aenv () aenv
 
   -- An expression that has already been lifted
   PushLExpC :: Elt e
@@ -290,12 +288,12 @@ liftPreOpenAcc vectAcc strength ctx size acc
     Scanr1 f a              -> scanr1L f a
     Permute f1 a1 f2 a2     -> permuteL f1 a1 f2 a2
     Backpermute sh f a      -> backpermuteL sh f a
-    Stencil f b a           -> stencilL f b a
-    Stencil2 f b1 a1 b2 a2  -> stencil2L f b1 a1 b2 a2
+    -- Stencil f b a           -> stencilL f b a
+    -- Stencil2 f b1 a1 b2 a2  -> stencil2L f b1 a1 b2 a2
 
     -- Transform only appears as part of subsequent optimsations.
     Transform{}             -> $internalError "liftPreOpenAcc" "unexpected 'Transform'"
-    Collect{}               -> error "Nested sequence"
+    -- Collect{}               -> error "Nested sequence"
 
   where
     nestedError :: String -> String -> String
@@ -652,7 +650,7 @@ liftPreOpenAcc vectAcc strength ctx size acc
                  -> acc (aenv', s) (Scalar Bool)
                  -> acc (aenv', s) (Vector' t, Vector Bool, Scalar Bool)
            iter' a f _ = let a' = liftedCondC f (inject $ weakenA1 iter_l `subApply` a) a
-                             f' = fromHOAS (S.zipWith (S.&&*)) f (values $ inject $ weakenA1 pred_l `subApply` a')
+                             f' = fromHOAS (S.zipWith (S.&&)) f (values $ inject $ weakenA1 pred_l `subApply` a')
                              c' = fromHOAS S.or f'
                          in atup3 a' f' c'
 
@@ -825,7 +823,7 @@ liftPreOpenAcc vectAcc strength ctx size acc
       $^ FoldSeg (weakenA4 f)
                  (the avar0)
                  (values avar3)
-                 (replicateSegC avar1 (fromHOAS (S.zipWith (\sh h -> S.shapeSize sh S.==* 0 S.? (0,h))) (fstA avar2) (sndA avar2)))
+                 (replicateSegC avar1 (fromHOAS (S.zipWith (\sh h -> S.shapeSize sh S.== 0 S.? (0,h))) (fstA avar2) (sndA avar2)))
     foldL _ _ _
       = error $ nestedError "first or second" "fold"
 
@@ -1160,39 +1158,6 @@ liftPreOpenAcc vectAcc strength ctx size acc
     permuteL _ _ _ _
       = error $ nestedError "first" "permute"
 
-    stencilL :: (Elt e, Elt e', Stencil sh e stencil)
-             => PreFun acc aenv (stencil -> e')
-             -> Boundary                (EltRepr e)
-             -> acc            aenv (Array sh e)
-             -> LiftedAcc  acc aenv' (Array sh e')
-    stencilL (cvtF1 -> (_, Just (AvoidedFun b1 f))) b (cvtA -> AvoidedAcc a)
-      = AvoidedAcc
-      $^ bind b1
-      $  Stencil f b (sink b1 a)
-    stencilL _                                      _ _
-      = error $ "Disallowed nested parallelism: Stencil operations must reside at the top level of "
-             ++ "the program nesting and the stencil function contain no nested parallelism."
-
-    stencil2L :: (Elt e', Stencil sh e2 stencil2, Stencil sh e1 stencil1)
-              => PreFun acc aenv (stencil1 ->
-                                          stencil2 -> e')
-              -> Boundary                (EltRepr e1)
-              -> acc            aenv (Array sh e1)
-              -> Boundary                (EltRepr e2)
-              -> acc            aenv (Array sh e2)
-              -> LiftedAcc  acc aenv' (Array sh e')
-    stencil2L (cvtF2 -> (_, Just (AvoidedFun binds f)))
-              b1
-              (cvtA -> AvoidedAcc a1)
-              b2
-              (cvtA -> AvoidedAcc a2)
-      = AvoidedAcc
-      $^ bind binds
-      $  Stencil2 f b1 (sink binds a1) b2 (sink binds a2)
-    stencil2L _                                 _  _  _  _
-      = error $ "Disallowed nested parallelism: Stencil operations must reside at the top level of "
-             ++ "parallel nesting and the supplied stencil function contain no nested parallelism."
-
 {--
     scanl1Lift :: forall aenv e. Elt e
                => PreFun acc aenv (e -> e -> e)
@@ -1305,6 +1270,30 @@ liftPreOpenAcc vectAcc strength ctx size acc
                                           = Avoided (env', e')
     avoidE _                              = Unavoided
 
+liftFun1 :: forall aenv sh a b. (Shape sh, Elt a, Elt b) 
+         => Fun aenv (a -> b)
+         -> OpenAfun aenv (Array sh a -> Array sh b)
+liftFun1 (Lam (Body b)) = Alam . Abody . OpenAcc $ reshape (liftExp vectoriseOpenAcc Aggressive ctx size b)
+  where
+    reshape :: PreOpenAcc OpenAcc (aenv, Vector a) (Vector b)
+            -> PreOpenAcc OpenAcc (aenv, Array sh a) (Array sh b)
+    reshape bs = Reshape (Shape avar0) . OpenAcc
+               $ Alet (flatten avar0) (weaken ixt (OpenAcc bs))
+               
+    ixt :: forall aenv. (aenv, Vector a) :> ((aenv, Array sh a), Vector a)
+    ixt ZeroIdx = ZeroIdx
+    ixt (SuccIdx ix) = SuccIdx . SuccIdx $ ix
+  
+    flatten :: forall aenv. OpenAcc aenv (Array sh a)
+            -> OpenAcc aenv (Vector a)
+    flatten a = OpenAcc $ Alet a $ OpenAcc $ Reshape (index1 (ShapeSize (Shape avar0))) avar0
+    
+    ctx :: Context ((), a) aenv () (aenv, Vector a)
+    ctx = PushLExpC EmptyC
+    
+    size :: Size OpenAcc (aenv, Vector a)
+    size = ShapeSize (Shape avar0)
+    
 -- |Performs the lifting transform on a given scalar expression.
 --
 -- Because lifting is performed in the presence of higher dimensional arrays, the output of the
@@ -1822,7 +1811,7 @@ replicateSeg segs vals =
       vShape = S.index1 $ S.the length
       negs   = S.fill (S.index1 $ S.the length + 1) (-1 :: S.Exp Int)
       flags  = S.permute max negs (\ix -> S.index1 (offs S.! ix)) (S.enumFromN (S.shape segs) 0)
-      flags' = S.scanl1 (\a b -> b S./=* -1 S.? (b, a)) flags
+      flags' = S.scanl1 (\a b -> b S./= -1 S.? (b, a)) flags
       vals'  = S.backpermute vShape ((S.!) (S.map S.index1 flags')) vals
   in
   vals'
@@ -1861,7 +1850,7 @@ enumSeg segs = S.zipWith S.fromIndex shapes (enumSegLinear segs)
 -- |Convert segment shapes into segment offsets along with total length
 --
 offsets :: Shape sh => S.Acc (Segments sh) -> (S.Acc (Segments Int), S.Acc (Scalar Int))
-offsets segs = S.scanl' (+) 0 $ S.map (S.shapeSize) segs
+offsets segs = S.unlift $ S.scanl' (+) 0 $ S.map (S.shapeSize) segs
 
 makeNonEmpty :: forall sh. Shape sh => S.Acc (Segments sh) -> S.Acc (Segments sh)
 makeNonEmpty = S.map nonEmpty
@@ -2624,319 +2613,3 @@ trace header msg
 
 -- Sequence vectorisation
 -- ------------------------
-sequenceFreeAfun :: OpenAfun aenv t -> Bool
-sequenceFreeAfun afun =
-  case afun of
-    Alam f -> sequenceFreeAfun f
-    Abody b -> sequenceFreeAcc b
-
-sequenceFreeFun :: OpenFun env aenv t -> Bool
-sequenceFreeFun afun =
-  case afun of
-    Lam f -> sequenceFreeFun f
-    Body b -> sequenceFreeExp b
-
-sequenceFreeExp :: OpenExp env aenv t -> Bool
-sequenceFreeExp = travE
-  where
-    travF :: OpenFun env aenv t -> Bool
-    travF = sequenceFreeFun
-
-    travT :: Tuple (OpenExp env aenv) t -> Bool
-    travT = sequenceFreeTup
-
-    travA :: OpenAcc aenv t -> Bool
-    travA = sequenceFreeAcc
-
-    travE :: OpenExp env aenv t -> Bool
-    travE exp =
-      case exp of
-        Let bnd body            -> travE bnd && travE body
-        Var _                   -> True
-        Const _                 -> True
-        Tuple tup               -> travT tup
-        Prj _ t                 -> travE t
-        IndexNil                -> True
-        IndexCons sh sz         -> travE sh && travE sz
-        IndexHead sh            -> travE sh
-        IndexTail sh            -> travE sh
-        IndexAny                -> True
-        IndexSlice _ ix sh      -> travE ix && travE sh
-        IndexFull _ ix sl       -> travE ix && travE sl
-        ToIndex sh ix           -> travE sh && travE ix
-        FromIndex sh ix         -> travE sh && travE ix
-        Cond p t e              -> travE p && travE t && travE e
-        While p f x             -> travF p && travF f && travE x
-        PrimConst _             -> True
-        PrimApp _ x             -> travE x
-        Index a sh              -> travA a && travE sh
-        LinearIndex a i         -> travA a && travE i
-        Shape a                 -> travA a
-        ShapeSize sh            -> travE sh
-        Intersect s t           -> travE s && travE t
-        Union s t               -> travE s && travE t
-        Foreign _ f e           -> travF f && travE e
-
-sequenceFreeAtup :: Atuple (OpenAcc aenv) t -> Bool
-sequenceFreeAtup t =
-  case t of
-    NilAtup -> True
-    SnocAtup t e -> sequenceFreeAtup t && sequenceFreeAcc e
-
-sequenceFreeTup :: Tuple (OpenExp env aenv) t -> Bool
-sequenceFreeTup t =
-  case t of
-    NilTup -> True
-    SnocTup t e -> sequenceFreeTup t && sequenceFreeExp e
-
-sequenceFreeAcc :: OpenAcc aenv a -> Bool
-sequenceFreeAcc = travA
-  where
-    travAfun :: OpenAfun aenv t -> Bool
-    travAfun = sequenceFreeAfun
-
-    travE :: Exp aenv t -> Bool
-    travE = sequenceFreeExp
-
-    travF :: Fun aenv t -> Bool
-    travF = sequenceFreeFun
-
-    travAT :: Atuple (OpenAcc aenv) t -> Bool
-    travAT = sequenceFreeAtup
-
-    travA :: OpenAcc aenv t -> Bool
-    travA (OpenAcc acc) =
-      case acc of
-        Alet bnd body             -> travA bnd && travA body
-        Avar _                    -> True
-        Atuple tup                -> travAT tup
-        Aprj _ a                  -> travA a
-        Apply f a                 -> travAfun f && travA a
-        Aforeign _ afun acc       -> travAfun afun && travA acc
-        Acond p t e               -> travE p && travA t && travA e
-        Awhile p f a              -> travAfun p && travAfun f && travA a
-        Use _                     -> True
-        Unit e                    -> travE e
-        Reshape e a               -> travE e && travA a
-        Generate e f              -> travE e && travF f
-        Transform sh ix f a       -> travE sh && travF ix && travF f && travA a
-        Replicate _ slix a        -> travE slix && travA a
-        Slice _ a slix            -> travA a && travE slix
-        Map f a                   -> travF f && travA a
-        ZipWith f a1 a2           -> travF f && travA a1 && travA a2
-        Fold f z a                -> travF f && travE z && travA a
-        Fold1 f a                 -> travF f && travA a
-        Scanl f z a               -> travF f && travE z && travA a
-        Scanl' f z a              -> travF f && travE z && travA a
-        Scanl1 f a                -> travF f && travA a
-        Scanr f z a               -> travF f && travE z && travA a
-        Scanr' f z a              -> travF f && travE z && travA a
-        Scanr1 f a                -> travF f && travA a
-        Permute f1 a1 f2 a2       -> travF f1 && travA a1 && travF f2 && travA a2
-        Backpermute sh f a        -> travE sh && travF f && travA a
-        Stencil f _ a             -> travF f && travA a
-        Stencil2 f _ a1 _ a2      -> travF f && travA a1 && travA a2
-        -- Interesting case:
-        Collect _                 -> False
-        FoldSeg f z a s           -> travF f && travE z && travA a && travA s
-        Fold1Seg f a s            -> travF f && travA a && travA s
-
-vectoriseSeq :: PreOpenSeq OpenAcc () () a -> PreOpenSeq OpenAcc () () a
-vectoriseSeq = vectoriseOpenSeq Aggressive EmptyC
-
-vectoriseOpenSeq
-    :: forall aenv senv a.
-       Strength
-    -> Context () aenv () aenv
-    -> PreOpenSeq OpenAcc aenv senv a
-    -> PreOpenSeq OpenAcc aenv senv a
-vectoriseOpenSeq strength ctx seq =
-  case seq of
-    Producer p s -> Producer (cvtP p) (vectoriseOpenSeq strength ctx s)
-    Consumer c   -> Consumer (cvtC c)
-    Reify ix     -> Reify ix
-    where
-      cvtP :: Producer OpenAcc aenv senv t -> Producer OpenAcc aenv senv t
-      cvtP p =
-        case p of
-          StreamIn arrs           -> StreamIn arrs
-          ToSeq sl slix a         -> ToSeq sl slix (cvtA a)
-          ChunkedMapSeq f x       -> ChunkedMapSeq (cvtAfun f) x
-          ZipWithSeq f x y        -> ZipWithSeq (cvtAfun f) x y
-          ScanSeq f e x           -> ScanSeq (cvtF f) (cvtE e) x
-
-          -- Interesting case:
-          MapSeq f x
-            | sequenceFreeAfun f  -> trace "vectoriseSeq" "MapSeq succesfully vectorised" -- ++ show (liftOpenAfun1 strength ctx (cvtAfun f))) $
-                                   $ ChunkedMapSeq (liftOpenAfun1 strength ctx (cvtAfun f)) x
-          -- The following case is needed because we don't know how to lift
-          -- sequences yet.
-            | otherwise           -> trace "vectoriseSeq" "MapSeq could not be vectorised" -- ++ show (cvtAfun f)) $
-                                   $ MapSeq (cvtAfun f) x
-
-      cvtC :: Consumer OpenAcc aenv senv t -> Consumer OpenAcc aenv senv t
-      cvtC c =
-        case c of
-          FoldSeq f e x        -> FoldSeq (cvtF f) (cvtE e) x
-          FoldSeqFlatten f a x -> FoldSeqFlatten (cvtAfun f) (cvtA a) x
-          Stuple t             -> Stuple (cvtCT t)
-
-      cvtCT :: Atuple (Consumer OpenAcc aenv senv) t -> Atuple (Consumer OpenAcc aenv senv) t
-      cvtCT NilAtup        = NilAtup
-      cvtCT (SnocAtup t c) = SnocAtup (cvtCT t) (cvtC c)
-
-      cvtE :: Exp aenv t -> Exp aenv t
-      cvtE = vectoriseSeqOpenExp strength ctx
-
-      cvtF :: Fun aenv t -> Fun aenv t
-      cvtF = vectoriseSeqOpenFun strength ctx
-
-      cvtA :: OpenAcc aenv t -> OpenAcc aenv t
-      cvtA = vectoriseSeqOpenAcc strength ctx
-
-      cvtAfun :: OpenAfun aenv t -> OpenAfun aenv t
-      cvtAfun = vectoriseSeqOpenAfun strength ctx
-
-stripExpCtx :: Context env aenv env aenv -> Context () aenv () aenv
-stripExpCtx c =
-  case c of
-    EmptyC      -> EmptyC
-    PushExpC c' -> stripExpCtx c'
-    PushAccC c' -> PushAccC (stripExpCtx c')
-    _           -> $internalError "stripExpCtx" "unreachable"
-
-vectoriseSeqOpenExp
-    :: forall env aenv a.
-       Strength
-    -> Context env aenv env aenv
-    -> OpenExp env aenv a
-    -> OpenExp env aenv a
-vectoriseSeqOpenExp strength ctx = cvtE
-  where
-    cvtA :: OpenAcc aenv t -> OpenAcc aenv t
-    cvtA a = vectoriseSeqOpenAcc strength (stripExpCtx ctx) a
-
-    cvtT :: Tuple (OpenExp env aenv) t -> Tuple (OpenExp env aenv) t
-    cvtT tup =
-      case tup of
-        NilTup      -> NilTup
-        SnocTup t a -> cvtT t `SnocTup` cvtE a
-
-    cvtF :: OpenFun env aenv t -> OpenFun env aenv t
-    cvtF = vectoriseSeqOpenFun strength ctx
-
-    cvtE :: OpenExp env aenv t -> OpenExp env aenv t
-    cvtE exp =
-      case exp of
-        Let bnd body            -> Let (cvtE bnd) (vectoriseSeqOpenExp strength (PushExpC ctx) body)
-        Var ix                  -> Var ix
-        Const c                 -> Const c
-        Tuple tup               -> Tuple (cvtT tup)
-        Prj tup t               -> Prj tup (cvtE t)
-        IndexNil                -> IndexNil
-        IndexCons sh sz         -> IndexCons (cvtE sh) (cvtE sz)
-        IndexHead sh            -> IndexHead (cvtE sh)
-        IndexTail sh            -> IndexTail (cvtE sh)
-        IndexAny                -> IndexAny
-        IndexSlice x ix sh      -> IndexSlice x (cvtE ix) (cvtE sh)
-        IndexFull x ix sl       -> IndexFull x (cvtE ix) (cvtE sl)
-        ToIndex sh ix           -> ToIndex (cvtE sh) (cvtE ix)
-        FromIndex sh ix         -> FromIndex (cvtE sh) (cvtE ix)
-        Cond p t e              -> Cond (cvtE p) (cvtE t) (cvtE e)
-        While p f x             -> While (cvtF p) (cvtF f) (cvtE x)
-        PrimConst c             -> PrimConst c
-        PrimApp f x             -> PrimApp f (cvtE x)
-        Index a sh              -> Index (cvtA a) (cvtE sh)
-        LinearIndex a i         -> LinearIndex (cvtA a) (cvtE i)
-        Shape a                 -> Shape (cvtA a)
-        ShapeSize sh            -> ShapeSize (cvtE sh)
-        Intersect s t           -> Intersect (cvtE s) (cvtE t)
-        Union s t               -> Union (cvtE s) (cvtE t)
-        Foreign ff f e          -> Foreign ff (vectoriseSeqOpenFun strength EmptyC f) (cvtE e)
-
-vectoriseSeqAcc :: OpenAcc () a -> OpenAcc () a
-vectoriseSeqAcc = vectoriseSeqOpenAcc Aggressive EmptyC
-
-vectoriseSeqOpenAcc
-    :: forall aenv a.
-       Strength
-    -> Context () aenv () aenv
-    -> OpenAcc aenv a
-    -> OpenAcc aenv a
-vectoriseSeqOpenAcc strength ctx = cvtA
-  where
-    cvtT :: Atuple (OpenAcc aenv) t -> Atuple (OpenAcc aenv) t
-    cvtT atup = case atup of
-                  NilAtup      -> NilAtup
-                  SnocAtup t a -> cvtT t `SnocAtup` cvtA a
-
-    cvtAfun :: OpenAfun aenv t -> OpenAfun aenv t
-    cvtAfun = vectoriseSeqOpenAfun strength ctx
-
-    cvtE :: Exp aenv t -> Exp aenv t
-    cvtE = vectoriseSeqOpenExp strength ctx
-
-    cvtF :: Fun aenv t -> Fun aenv t
-    cvtF = vectoriseSeqOpenFun strength ctx
-
-    cvtA :: OpenAcc aenv t -> OpenAcc aenv t
-    cvtA (OpenAcc pacc)
-      = OpenAcc
-      $ case pacc of
-          Alet bnd body             -> Alet (cvtA bnd) (vectoriseSeqOpenAcc strength (PushAccC ctx) body)
-          Avar ix                   -> Avar ix
-          Atuple tup                -> Atuple (cvtT tup)
-          Aprj tup a                -> Aprj tup (cvtA a)
-          Apply f a                 -> Apply (cvtAfun f) (cvtA a)
-          Aforeign ff afun acc      -> Aforeign ff (vectoriseSeqAfun afun) (cvtA acc)
-          Acond p t e               -> Acond (cvtE p) (cvtA t) (cvtA e)
-          Awhile p f a              -> Awhile (cvtAfun p) (cvtAfun f) (cvtA a)
-          Use a                     -> Use a
-          Unit e                    -> Unit (cvtE e)
-          Reshape e a               -> Reshape (cvtE e) (cvtA a)
-          Generate e f              -> Generate (cvtE e) (cvtF f)
-          Transform sh ix f a       -> Transform (cvtE sh) (cvtF ix) (cvtF f) (cvtA a)
-          Replicate sl slix a       -> Replicate sl (cvtE slix) (cvtA a)
-          Slice sl a slix           -> Slice sl (cvtA a) (cvtE slix)
-          Map f a                   -> Map (cvtF f) (cvtA a)
-          ZipWith f a1 a2           -> ZipWith (cvtF f) (cvtA a1) (cvtA a2)
-          Fold f z a                -> Fold (cvtF f) (cvtE z) (cvtA a)
-          Fold1 f a                 -> Fold1 (cvtF f) (cvtA a)
-          Scanl f z a               -> Scanl (cvtF f) (cvtE z) (cvtA a)
-          Scanl' f z a              -> Scanl' (cvtF f) (cvtE z) (cvtA a)
-          Scanl1 f a                -> Scanl1 (cvtF f) (cvtA a)
-          Scanr f z a               -> Scanr (cvtF f) (cvtE z) (cvtA a)
-          Scanr' f z a              -> Scanr' (cvtF f) (cvtE z) (cvtA a)
-          Scanr1 f a                -> Scanr1 (cvtF f) (cvtA a)
-          Permute f1 a1 f2 a2       -> Permute (cvtF f1) (cvtA a1) (cvtF f2) (cvtA a2)
-          Backpermute sh f a        -> Backpermute (cvtE sh) (cvtF f) (cvtA a)
-          Stencil f b a             -> Stencil (cvtF f) b (cvtA a)
-          Stencil2 f b1 a1 b2 a2    -> Stencil2 (cvtF f) b1 (cvtA a1) b2 (cvtA a2)
-          Collect s                 -> Collect (vectoriseOpenSeq strength ctx s)
-          FoldSeg f z a s           -> FoldSeg (cvtF f) (cvtE z) (cvtA a) (cvtA s)
-          Fold1Seg f a s            -> Fold1Seg (cvtF f) (cvtA a) (cvtA s)
-
-vectoriseSeqAfun :: OpenAfun () t -> OpenAfun () t
-vectoriseSeqAfun = vectoriseSeqOpenAfun Aggressive EmptyC
-
-vectoriseSeqOpenFun
-    :: forall env aenv t.
-        Strength
-    -> Context env aenv env aenv
-    -> OpenFun env aenv t
-    -> OpenFun env aenv t
-vectoriseSeqOpenFun strength ctx fun =
-  case fun of
-    Body b -> Body (vectoriseSeqOpenExp strength ctx b)
-    Lam f  -> Lam (vectoriseSeqOpenFun strength (PushExpC ctx) f)
-
-vectoriseSeqOpenAfun
-    :: Strength
-    -> Context () aenv () aenv
-    -> OpenAfun aenv t
-    -> OpenAfun aenv t
-vectoriseSeqOpenAfun strength ctx afun =
-  case afun of
-    Abody b -> Abody (vectoriseSeqOpenAcc strength ctx b)
-    Alam f  -> Alam (vectoriseSeqOpenAfun strength (PushAccC ctx) f)
-
